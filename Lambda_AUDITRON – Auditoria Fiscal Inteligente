@@ -1,0 +1,391 @@
+import streamlit as st
+import pandas as pd
+import duckdb
+import os
+import re
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.llms import Ollama
+from langchain.prompts import PromptTemplate
+from langchain.schema import HumanMessage
+from datetime import datetime, timedelta
+import random
+import io
+import zipfile # Importação adicionada para lidar com arquivos ZIP
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+
+# --- Funções do backend ---
+def formatar_moeda(valor: float) -> str:
+    """Formata valor para moeda brasileira"""
+    if not isinstance(valor, (int, float)):
+        return str(valor)
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def normalizar_nome_coluna(nome):
+    return nome.lower().strip().replace(" ", "_").replace("-", "_")
+
+def encontrar_coluna_similar(nome_buscado, colunas_df):
+    nome_normalizado = normalizar_nome_coluna(nome_buscado)
+    for col in colunas_df:
+        if normalizar_nome_coluna(col) == nome_normalizado:
+            return col
+    for col in colunas_df:
+        col_norm = normalizar_nome_coluna(col)
+        if nome_normalizado in col_norm or col_norm in nome_normalizado:
+            return col
+    return None
+
+def criar_dados_exemplo():
+    num_registros = 50
+    cfops = ['5102', '5403', '6102', '6108', '5949', '6949', '5101', '6101']
+    estados = ['SP', 'RJ', 'MG', 'RS', 'PR', 'SC', 'BA', 'GO']
+    dados = []
+    for i in range(num_registros):
+        valor_base = random.uniform(500, 50000)
+        dados.append({
+            'numero_nota': f"NF{str(i+1).zfill(6)}",
+            'cnpj_emissor': f"{random.randint(10000000, 99999999):08d}0001{random.randint(10, 99)}",
+            'cfop': random.choice(cfops),
+            'valor_total_nota': round(valor_base, 2),
+            'valor_icms': round(valor_base * random.uniform(0.1, 0.18), 2),
+            'valor_ipi': round(valor_base * random.uniform(0, 0.1), 2) if random.random() > 0.7 else 0,
+            'valor_irrf': round(valor_base * random.uniform(0.01, 0.05), 2) if random.random() > 0.6 else 0,
+            'estado': random.choice(estados),
+            'data_emissao': (datetime.now() - timedelta(days=random.randint(1, 365))).strftime('%Y-%m-%d'),
+        })
+    return pd.DataFrame(dados)
+
+def inicializar_llm(model_name: str):
+    if model_name == "gemini":
+        try:
+            llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1, convert_system_message_to_human=True)
+            llm.invoke([HumanMessage(content="Responda apenas: OK")])
+            return llm
+        except Exception as e:
+            st.error(f"⚠️ Falha ao inicializar o Gemini: {e}")
+            return None
+    elif model_name == "mistral":
+        try:
+            llm = Ollama(model="mistral")
+            llm.invoke("Responda apenas: OK")
+            return llm
+        except Exception as e:
+            st.error(f"⚠️ Falha ao inicializar o Mistral local. Certifique-se de que o Ollama está rodando e o modelo 'mistral' está disponível: {e}")
+            return None
+    return None
+
+def criar_prompt_sql(colunas_info_str: str) -> PromptTemplate:
+    template = """
+    Você é um especialista em análise fiscal e SQL. Converta a pergunta para uma consulta SQL DuckDB.
+    A tabela se chama 'df'.
+    As colunas disponíveis são:
+    {colunas_info_str}
+
+    PERGUNTA DO USUÁRIO: {pergunta}
+    SQL Query:
+    """
+    return PromptTemplate(input_variables=["colunas_info_str", "pergunta"], template=template)
+
+def interpretar_pergunta(pergunta: str, df: pd.DataFrame, llm_choice: str):
+    colunas_df = df.columns.tolist()
+    llm = None
+    if llm_choice == "gemini" and os.getenv('GOOGLE_API_KEY'):
+        llm = inicializar_llm("gemini")
+    elif llm_choice == "mistral":
+        llm = inicializar_llm("mistral")
+
+    if llm:
+        with st.spinner(f"🤖 Consultando o {llm_choice.capitalize()} para gerar o SQL..."):
+            colunas_info = [f"- '{col}' (Tipo: {df[col].dtype})" for col in colunas_df]
+            colunas_info_str = "\n".join(colunas_info)
+            prompt_template = criar_prompt_sql(colunas_info_str)
+            prompt_final = prompt_template.format(colunas_info_str=colunas_info_str, pergunta=pergunta)
+            try:
+                if llm_choice == "gemini":
+                    resposta = llm.invoke([HumanMessage(content=prompt_final)])
+                else:
+                    resposta = llm.invoke(prompt_final)
+                query_sql = resposta.content.strip().replace("```sql", "").replace("```", "")
+                return query_sql
+            except Exception as e:
+                st.error(f"Erro na chamada da IA ({llm_choice.capitalize()}): {e}")
+                return f"SELECT 'Erro ao gerar SQL com {llm_choice.capitalize()}. Tente novamente ou mude o modelo.' AS Erro;"
+    return f"SELECT 'Nenhum modelo de IA selecionado ou API Key ausente para Gemini.' AS Erro;"
+def executar_consulta(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    try:
+        return duckdb.query(query).to_df()
+    except Exception as e:
+        return pd.DataFrame({"Erro na execução do SQL": [str(e)]})
+
+# --- Nova função para carregar arquivos ---
+def load_uploaded_file(uploaded_file):
+    dfs = [] # Lista para armazenar DataFrames de arquivos dentro de ZIP
+    file_extension = os.path.splitext(uploaded_file.name)[1].lower()
+
+    try:
+        if file_extension == '.csv':
+            dfs.append(pd.read_csv(io.BytesIO(uploaded_file.getvalue()), sep=None, engine='python', encoding='latin-1'))
+        elif file_extension in ['.xls', '.xlsx']:
+            dfs.append(pd.read_excel(io.BytesIO(uploaded_file.getvalue())))
+        elif file_extension == '.zip':
+            
+            # Usa BytesIO para tratar o conteúdo do ZIP em memória
+            with zipfile.ZipFile(io.BytesIO(uploaded_file.getvalue()), 'r') as zf:
+                # Filtrar apenas arquivos (não diretórios) e tipos suportados
+                zip_contents = [name for name in zf.namelist() if not name.endswith('/') and (name.endswith('.csv') or name.endswith('.xls') or name.endswith('.xlsx'))]
+
+                if not zip_contents:
+                    st.warning(f"O arquivo ZIP '{uploaded_file.name}' não contém arquivos CSV, XLS ou XLSX válidos.")
+                    return None
+
+                for filename_in_zip in zip_contents:
+                    with zf.open(filename_in_zip) as file_in_zip:
+                        inner_file_extension = os.path.splitext(filename_in_zip)[1].lower()
+                        try:
+                            if inner_file_extension == '.csv':
+                                dfs.append(pd.read_csv(io.BytesIO(file_in_zip.read()), sep=None, engine='python', encoding='latin-1'))
+                            elif inner_file_extension in ['.xls', '.xlsx']:
+                                dfs.append(pd.read_excel(io.BytesIO(file_in_zip.read())))
+                            st.success(f"Arquivo '{filename_in_zip}' carregado com sucesso.")
+                        except Exception as inner_e:
+                            st.error(f"Erro ao carregar '{filename_in_zip}' do ZIP: {inner_e}")
+            if not dfs: # Se o ZIP foi lido mas não gerou nenhum DF válido
+                st.error(f"Nenhum arquivo CSV/XLS/XLSX válido foi extraído e carregado do ZIP '{uploaded_file.name}'.")
+                return None # Retorna None se nenhum DF foi carregado
+        elif file_extension == '.gz':
+            st.warning("Tentando ler arquivo GZ. Isso pode funcionar se o GZ contiver um único arquivo CSV que o pandas possa inferir.")
+            try:
+                dfs.append(pd.read_csv(io.BytesIO(uploaded_file.getvalue()), sep=None, engine='python', encoding='latin-1', compression='gzip'))
+            except Exception as e:
+                st.error(f"Não foi possível ler o arquivo GZ diretamente como CSV: {e}")
+                return None
+        else:
+            st.warning(f"Extensão de arquivo não suportada: {file_extension}. Apenas .csv, .xls, .xlsx, .zip e .gz (para CSVs) são totalmente suportados.")
+            return None
+    except Exception as e:
+        st.error(f"Erro ao carregar o arquivo {uploaded_file.name}: {e}")
+        return None
+
+    if dfs:
+        # Se múltiplos DFs foram carregados (e.g., de um ZIP), concatena-os
+        return pd.concat(dfs, ignore_index=True)
+    return None # Retorna None se nenhum DF foi carregado
+
+# --- Funções para Download ---
+def gerar_csv_download(df: pd.DataFrame) -> bytes:
+    """Gera arquivo CSV para download"""
+    buffer = io.StringIO()
+    df.to_csv(buffer, index=False, encoding='utf-8-sig')
+    return buffer.getvalue().encode('utf-8-sig')
+
+def gerar_pdf_download(df: pd.DataFrame, pergunta: str, query_sql: str) -> bytes:
+    """Gera arquivo PDF para download"""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Título
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=16,
+        spaceAfter=30,
+        textColor=colors.darkblue
+    )
+    story.append(Paragraph("Relatório de Auditoria Fiscal", title_style))
+    story.append(Spacer(1, 12))
+
+    # Informações da consulta
+    story.append(Paragraph(f"<b>Data/Hora:</b> {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", styles['Normal']))
+    story.append(Paragraph(f"<b>Pergunta:</b> {pergunta}", styles['Normal']))
+    story.append(Spacer(1, 12))
+
+    # SQL Query
+    story.append(Paragraph("<b>Consulta SQL Executada:</b>", styles['Heading2']))
+    story.append(Paragraph(f"<font name='Courier'>{query_sql}</font>", styles['Normal']))
+    story.append(Spacer(1, 12))
+
+    # Resultados
+    story.append(Paragraph(f"<b>Resultados Encontrados:</b> {len(df)} registros", styles['Heading2']))
+    story.append(Spacer(1, 12))
+
+    if len(df) > 0 and not df.empty:
+        # Preparar dados da tabela
+        # Limitar colunas se houver muitas (para caber na página)
+        max_cols = 6
+        df_display = df.iloc[:, :max_cols] if len(df.columns) > max_cols else df
+
+        # Converter DataFrame para lista de listas
+        data = [df_display.columns.tolist()]
+        for _, row in df_display.head(50).iterrows():  # Limitar a 50 linhas para o PDF
+            data.append([str(cell)[:30] + "..." if len(str(cell)) > 30 else str(cell) for cell in row])
+
+        # Criar tabela
+        table = Table(data)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+
+        story.append(table)
+
+        if len(df) > 50:
+            story.append(Spacer(1, 12))
+            story.append(Paragraph(f"<i>Mostrando apenas os primeiros 50 registros de {len(df)} encontrados.</i>", styles['Normal']))
+    else:
+        story.append(Paragraph("Nenhum resultado encontrado.", styles['Normal']))
+
+    # Rodapé
+    story.append(Spacer(1, 30))
+    story.append(Paragraph("Relatório gerado pelo Auditron com IA", styles['Normal']))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# --- Interface Gráfica com Streamlit ---
+st.set_page_config(page_title="Auditron com IA", layout="wide", page_icon="🤖")
+
+if 'df' not in st.session_state:
+    st.session_state.df = None
+if 'llm_choice' not in st.session_state:
+    st.session_state.llm_choice = "gemini"
+if 'ultimo_resultado' not in st.session_state:
+    st.session_state.ultimo_resultado = None
+if 'ultima_pergunta' not in st.session_state:
+    st.session_state.ultima_pergunta = ""
+if 'ultimo_sql' not in st.session_state:
+    st.session_state.ultimo_sql = ""
+
+with st.sidebar:
+    st.title("🤖 Auditron com IA")
+    st.header("1. Escolha e Configure sua IA")
+    
+    llm_choice = st.radio("Escolha o Modelo de IA:", ("gemini", "mistral"), key='llm_selection')
+    st.session_state.llm_choice = llm_choice
+
+    if llm_choice == "gemini":
+        api_key = st.text_input("Google Gemini API Key", type="password", help="Obtenha em makersuite.google.com")
+        if api_key:
+            os.environ['GOOGLE_API_KEY'] = api_key
+            st.success("API Key Gemini inserida!", icon="🔑")
+        else:
+            st.warning("Por favor, insira sua GOOGLE API KEY para usar o Gemini.", icon="⚠️")
+    elif llm_choice == "mistral":
+        st.info("Para usar o Mistral local, certifique-se de que o Ollama está rodando e o modelo 'mistral' está instalado.")
+
+    st.header("2. Carregue seus dados")
+    fonte_dados = st.radio("Origem:", ('Enviar Arquivo', 'Dados de Exemplo'), key='data_source')
+
+    if fonte_dados == 'Enviar Arquivo':
+        uploaded_files = st.file_uploader(
+            "Selecione arquivos de planilha (CSV, Excel) ou compactados (ZIP, GZ)",
+            type=["csv", "xls", "xlsx", "zip", "gz"],
+            accept_multiple_files=True
+        )
+        if uploaded_files:
+            if st.button("Carregar Dados", use_container_width=True):
+                with st.spinner("Processando..."):
+                    all_dfs = []
+                    for uploaded_file in uploaded_files:
+                        current_df = load_uploaded_file(uploaded_file)
+                        if current_df is not None:
+                            all_dfs.append(current_df)
+
+                    if all_dfs:
+                        st.session_state.df = pd.concat(all_dfs, ignore_index=True)
+                        st.success(f"✅ {len(st.session_state.df)} registros carregados de {len(all_dfs)} arquivo(s).")
+                    else:
+                        st.error("Nenhum arquivo válido foi carregado.")
+                        st.session_state.df = None
+    else:
+        if st.button("Gerar Dados de Exemplo", use_container_width=True):
+            st.session_state.df = criar_dados_exemplo()
+            st.success(f"✅ Dados de exemplo gerados!")
+
+st.header("🔍 Auditoria Fiscal Interativa")
+
+if st.session_state.df is None:
+    st.info("👋 Bem-vindo! Carregue seus dados na barra lateral para começar.")
+else:
+    df = st.session_state.df
+    ia_status = f"✅ {st.session_state.llm_choice.capitalize()} Ativada" if (st.session_state.llm_choice == "gemini" and os.getenv("GOOGLE_API_KEY")) or (st.session_state.llm_choice == "mistral") else "⚠️ IA Desativada"
+    with st.expander("Visualizar dados e estatísticas", expanded=False):
+        st.dataframe(df.head())
+        col1, col2 = st.columns(2)
+        col1.metric("Total de Registros", f"{len(df):,}")
+        col2.metric("Total de Colunas", f"{len(df.columns)}")
+        cols_valor = [c for c in df.columns if 'valor' in c.lower() and pd.api.types.is_numeric_dtype(df[c])]
+        if cols_valor:
+            total = df[cols_valor[0]].sum()
+            st.metric(f"Total {cols_valor[0]}", formatar_moeda(total))
+
+    st.subheader(f"Faça sua pergunta ({ia_status})")
+    pergunta_usuario = st.text_area("Digite em linguagem natural:", height=100)
+
+    if st.button("Executar Auditoria", type="primary"):
+        if pergunta_usuario:
+            query_sql = interpretar_pergunta(pergunta_usuario, df, st.session_state.llm_choice)
+            st.code(query_sql, language="sql")
+            resultado_df = executar_consulta(df, query_sql)
+
+            # Salvar resultados no session_state
+            st.session_state.ultimo_resultado = resultado_df
+            st.session_state.ultima_pergunta = pergunta_usuario
+            st.session_state.ultimo_sql = query_sql
+
+            st.dataframe(resultado_df)
+            st.success(f"{len(resultado_df)} registros encontrados.")
+        else:
+            st.warning("Digite uma pergunta.")
+
+    # Seção de Downloads
+    if st.session_state.ultimo_resultado is not None and not st.session_state.ultimo_resultado.empty:
+        st.subheader("📥 Downloads do Resultado")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            # Download CSV
+            csv_data = gerar_csv_download(st.session_state.ultimo_resultado)
+            st.download_button(
+                label="📊 Baixar CSV",
+                data=csv_data,
+                file_name=f"auditoria_resultado_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        with col2:
+            # Download PDF
+            try:
+                pdf_data = gerar_pdf_download(
+                    st.session_state.ultimo_resultado,
+                    st.session_state.ultima_pergunta,
+                    st.session_state.ultimo_sql
+                )
+                st.download_button(
+                    label="📄 Baixar PDF",
+                    data=pdf_data,
+                    file_name=f"relatorio_auditoria_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+            except Exception as e:
+                st.error(f"Erro ao gerar PDF: {e}")
+                st.info("💡 Para usar o download PDF, instale: pip install reportlab")
+
+        # Informações sobre os downloads
+        st.info(f"📋 **Último resultado:** {len(st.session_state.ultimo_resultado)} registros | **Pergunta:** {st.session_state.ultima_pergunta[:50]}...")
+
